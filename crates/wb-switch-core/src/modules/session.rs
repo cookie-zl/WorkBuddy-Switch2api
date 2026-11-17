@@ -656,18 +656,34 @@ const SQL_IS_CLAW: &str = "(LOWER(cwd) LIKE '%\\claw' OR LOWER(cwd) LIKE '%/claw
 /// 与 `copy_sessions_for_switch`（复制成新 id，越切越多）不同，本路径**不新增任何行**，
 /// 因此可以放心地在每次切换时执行。
 ///
+/// 同时把「分组」的归属对齐到目标账号，原因见 `share_sessions_in` 内注释。
+///
 /// Claw 工作区绑定 IM 渠道账号，跳过不动。
 pub fn share_sessions_for_switch() -> Result<Value, String> {
-    share_sessions_for_switch_for(Edition::Domestic)
+    share_sessions_for_switch_for(Edition::Domestic, None)
 }
 
 /// 指定档位的「多账号共享」（两个档位都有独立会话库，各自处理）。
-pub fn share_sessions_for_switch_for(edition: Edition) -> Result<Value, String> {
-    share_sessions_in(&workbuddy_db_path_for(edition))
+///
+/// `target_acc` 是切换的目标账号。切换流程里认证文件尚未写入，
+/// 此时 `current_user_uid_for` 拿到的还是**旧账号**，所以必须由调用方显式传入。
+/// 传 `None` 时回退到读认证文件（用于切换完成之后再对齐的场景）。
+pub fn share_sessions_for_switch_for(
+    edition: Edition,
+    target_acc: Option<&Value>,
+) -> Result<Value, String> {
+    let uid = target_acc
+        .and_then(|v| v.get("uid"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| current_user_uid_for(edition))
+        .ok_or_else(|| "无法确定目标账号 uid".to_string())?;
+    share_sessions_in(&workbuddy_db_path_for(edition), &uid)
 }
 
-/// `share_sessions_for_switch` 的实现（可传入 db 路径，便于单测）。
-fn share_sessions_in(db: &Path) -> Result<Value, String> {
+/// `share_sessions_for_switch` 的实现（可传入 db 路径与目标 uid，便于单测）。
+fn share_sessions_in(db: &Path, target_uid: &str) -> Result<Value, String> {
     if !db.is_file() {
         return Err(format!("找不到 {db:?}"));
     }
@@ -692,41 +708,31 @@ fn share_sessions_in(db: &Path) -> Result<Value, String> {
     );
     let shared = conn.execute(&sql_share, []).map_err(|e| e.to_string())?;
 
-    // ── 分组（spaces）归一化 ──────────────────────────────────────────────
-    // 2026-11 起的客户端把「分组」独立成 spaces 表，并按账号 uid 隔离：
-    //     WHERE spaces.user_id = 当前账号
-    //     LEFT JOIN sessions ON sessions.space_id = spaces.id
-    //                        AND sessions.user_id = spaces.user_id
-    // 会话 user_id 被置空后，这个 JOIN 永远不成立 —— 分组显示为 0 条的空壳；
-    // 切换账号后 spaces.user_id 与当前账号不符，分组更是整体消失。
-    // 因此这里把分组一并软删（客户端判据是 deleted_at < 0 为未删，
-    // 置正数即视为已删除且不会被 seed 逻辑重建），并解绑会话，
-    // 让侧栏退回「按工作目录聚合」——与账号完全无关，切多少次都一致。
+    // ── 分组（spaces）归属对齐 ────────────────────────────────────────────
+    // 2026-11 起的客户端把「分组」独立成 spaces 表，列表查询按账号隔离：
+    //     WHERE spaces.user_id = 当前账号 AND status='active' AND deleted_at < 0
+    // 所以切换后必须把分组的 user_id 跟到目标账号，否则分组整体不可见。
+    //
+    // 关键：**不要清空 sessions.space_id，也不要软删分组**。
+    // 客户端分组详情页的条件是
+    //     space_id = ? AND is_playground = 0 AND (user_id = 当前账号 OR user_id = '')
+    // 无主会话照样能进分组；只有侧栏上的计数走严格 JOIN（user_id 必须相等）才显示 0。
+    // 结论：会话无主 + 分组有主 = 既能跨账号共享，分组也保得住。
+    //
     // 旧版本没有 spaces 表，直接跳过。
-    let (spaces_neutralized, sessions_unbound) = if table_exists(&conn, "spaces")
-        && column_exists(&conn, "sessions", "space_id")
-    {
+    let spaces_reassigned = if table_exists(&conn, "spaces") {
         let now = now_ms();
-        let n = conn
-            .execute(
-                "UPDATE spaces SET deleted_at = ?1, updated_at = ?1 WHERE deleted_at < 0",
-                [now],
-            )
-            .unwrap_or(0);
-        let u = conn
-            .execute(
-                "UPDATE sessions SET space_id = NULL \
-                 WHERE space_id IS NOT NULL AND space_id <> ''",
-                [],
-            )
-            .unwrap_or(0);
-        (n as i64, u as i64)
+        conn.execute(
+            "UPDATE spaces SET user_id = ?1, updated_at = ?2 \
+             WHERE deleted_at < 0 AND user_id <> ?1",
+            rusqlite::params![target_uid, now],
+        )
+        .unwrap_or(0) as i64
     } else {
-        (0, 0)
+        0
     };
 
-    // 分组走「按目录聚合」后，显示名依赖本文件；新目录缺失会退化成完整路径。
-    // 放在归位之后执行：此时 space_id 已清空，cwd 集合不受影响。
+    // 分组走「按目录聚合」时显示名依赖本文件；新目录缺失会退化成完整路径。
     let display_names = sync_workspace_display_names(&conn, db)
         .unwrap_or_else(|e| json!({ "error": e }));
 
@@ -739,8 +745,7 @@ fn share_sessions_in(db: &Path) -> Result<Value, String> {
         "total": alive,
         "shared": shared as i64,
         "skippedClaw": skipped_claw,
-        "spacesNeutralized": spaces_neutralized,
-        "sessionsUnbound": sessions_unbound,
+        "spacesReassigned": spaces_reassigned,
         "displayNames": display_names,
     }))
 }
@@ -848,7 +853,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let report = share_sessions_in(&db).unwrap();
+        let report = share_sessions_in(&db, "uid-b").unwrap();
         assert_eq!(report["shared"], 1, "只应共享未删除的非 Claw 会话: {report}");
         assert_eq!(report["skippedClaw"], 1, "Claw 应被跳过: {report}");
 
@@ -869,7 +874,7 @@ mod tests {
     #[test]
     fn share_sessions_missing_db_is_err_not_panic() {
         let db = temp_db("share-missing");
-        assert!(share_sessions_in(&db).is_err());
+        assert!(share_sessions_in(&db, "uid-b").is_err());
     }
 
     #[test]
