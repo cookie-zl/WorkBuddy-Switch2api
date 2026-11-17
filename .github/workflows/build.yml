@@ -213,7 +213,11 @@ jobs:
         run: |
           VER="${GITHUB_REF_NAME#v}"
           if ! [[ "$VER" =~ ^[0-9] ]]; then
-            VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+            # 手动触发（workflow_dispatch）时 GITHUB_REF_NAME 是分支名，回退到版本真源。
+            # 注意 src-tauri/Cargo.toml 用 version.workspace = true 继承，那里没有具体
+            # 版本号，必须读根 Cargo.toml 的 [workspace.package]，否则取到的是
+            # "version.workspace = true" 这串文字，后面的 test -f 一定失败。
+            VER=$(node -e "const fs=require('fs');const s=fs.readFileSync('Cargo.toml','utf8');const m=s.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*\"([^\"]+)\"/);if(!m)process.exit(1);console.log(m[1])")
           fi
           BUNDLE_ROOT="target/${{ matrix.target }}/release/bundle"
           # cargo cache 会保留旧 NSIS/DMG/AppImage；不清理就会把 0.1.17 一类产物带进 Release。
@@ -251,7 +255,11 @@ jobs:
         run: |
           VER="${GITHUB_REF_NAME#v}"
           if ! [[ "$VER" =~ ^[0-9] ]]; then
-            VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+            # 手动触发（workflow_dispatch）时 GITHUB_REF_NAME 是分支名，回退到版本真源。
+            # 注意 src-tauri/Cargo.toml 用 version.workspace = true 继承，那里没有具体
+            # 版本号，必须读根 Cargo.toml 的 [workspace.package]，否则取到的是
+            # "version.workspace = true" 这串文字，后面的 test -f 一定失败。
+            VER=$(node -e "const fs=require('fs');const s=fs.readFileSync('Cargo.toml','utf8');const m=s.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*\"([^\"]+)\"/);if(!m)process.exit(1);console.log(m[1])")
           fi
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
