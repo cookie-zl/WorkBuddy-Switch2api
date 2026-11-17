@@ -150,6 +150,118 @@ fn nonempty_text(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 规范化工作目录：反斜杠转正斜杠、去尾斜杠、盘符大写。
+///
+/// 客户端所有路径比对都是字符串精确匹配，写法不一致会被当成两个不同目录。
+fn normalize_workspace_path(raw: &str) -> String {
+    let mut s = raw.trim().replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 2 && chars[1] == ':' && chars[0].is_ascii_lowercase() {
+        let mut owned = chars;
+        owned[0] = owned[0].to_ascii_uppercase();
+        s = owned.into_iter().collect();
+    }
+    s
+}
+
+/// 分组短名：普通目录取末段；一次性时间戳工作区命名为 `临时 MM-DD HH:mm`。
+fn workspace_short_name(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let prefix = path.strip_suffix(base).unwrap_or("");
+    let shape_ok = base.len() == 19
+        && base.as_bytes().iter().enumerate().all(|(i, c)| match i {
+            4 | 7 | 10 | 13 | 16 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        });
+    if shape_ok && prefix.to_ascii_lowercase().ends_with("/workbuddy/") {
+        return format!(
+            "临时 {} {}:{}",
+            &base[5..10],
+            &base[11..13],
+            &base[14..16]
+        );
+    }
+    base.to_string()
+}
+
+/// 补齐 `workspace-display-names.json`：把会话里出现过、但映射表缺失的工作目录补进去。
+///
+/// 客户端取名顺序是 `spaces.name` → 本文件 → 完整 `cwd`。分组走「按目录聚合」后，
+/// 新目录若不在本文件里，侧栏会直接显示 `C:/Users/.../xxx` 这类完整路径。
+/// 这里每次切换时增量补齐，做到零维护。
+fn sync_workspace_display_names(conn: &Connection, db: &Path) -> Result<Value, String> {
+    let Some(dir) = db.parent() else {
+        return Ok(json!({ "added": 0, "total": 0 }));
+    };
+    let file = dir.join("workspace-display-names.json");
+
+    // 只处理两种确定安全的输入：
+    //   1) 文件不存在      —— 按当前客户端格式新建
+    //   2) 已是 {workspaces:{...}} —— 增量补齐
+    // 其余情况（读不出、解析失败、结构不认识）一律跳过不写。
+    // 这样即使某个旧版本用了别的格式，也不会被我们改坏或遮蔽原有映射。
+    let mut root: Value = if file.exists() {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return Ok(json!({ "added": 0, "total": 0, "skipped": "unreadable" }));
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            return Ok(json!({ "added": 0, "total": 0, "skipped": "unparsable" }));
+        };
+        if !parsed.get("workspaces").is_some_and(Value::is_object) {
+            return Ok(json!({ "added": 0, "total": 0, "skipped": "unknown-shape" }));
+        }
+        parsed
+    } else {
+        json!({ "version": 1, "workspaces": {} })
+    };
+
+    let obj = root.as_object_mut().ok_or("display names root not object")?;
+    obj.entry("version").or_insert(json!(1));
+    let workspaces = obj
+        .get_mut("workspaces")
+        .and_then(Value::as_object_mut)
+        .ok_or("display names workspaces not object")?;
+    let before = workspaces.len();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT cwd FROM sessions \
+             WHERE COALESCE(deleted_at, -1) < 0 AND cwd IS NOT NULL AND cwd <> ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+
+    let now = now_ms();
+    for raw in rows.flatten() {
+        let path = normalize_workspace_path(&raw);
+        if path.is_empty() || workspaces.contains_key(&path) {
+            continue;
+        }
+        workspaces.insert(
+            path.clone(),
+            json!({
+                "id": &path,
+                "path": &path,
+                "displayName": workspace_short_name(&path),
+                "updatedAt": now,
+            }),
+        );
+    }
+
+    let total = workspaces.len();
+    let added = total - before;
+    if added > 0 {
+        let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+        std::fs::write(&file, body).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({ "added": added, "total": total }))
+}
+
 /// WorkBuddy 侧栏展示名：优先 custom_title（用户改名 / 定时任务名），否则 title。
 fn session_display_title(title: Option<String>, custom_title: Option<String>) -> String {
     nonempty_text(custom_title)
@@ -580,6 +692,44 @@ fn share_sessions_in(db: &Path) -> Result<Value, String> {
     );
     let shared = conn.execute(&sql_share, []).map_err(|e| e.to_string())?;
 
+    // ── 分组（spaces）归一化 ──────────────────────────────────────────────
+    // 2026-11 起的客户端把「分组」独立成 spaces 表，并按账号 uid 隔离：
+    //     WHERE spaces.user_id = 当前账号
+    //     LEFT JOIN sessions ON sessions.space_id = spaces.id
+    //                        AND sessions.user_id = spaces.user_id
+    // 会话 user_id 被置空后，这个 JOIN 永远不成立 —— 分组显示为 0 条的空壳；
+    // 切换账号后 spaces.user_id 与当前账号不符，分组更是整体消失。
+    // 因此这里把分组一并软删（客户端判据是 deleted_at < 0 为未删，
+    // 置正数即视为已删除且不会被 seed 逻辑重建），并解绑会话，
+    // 让侧栏退回「按工作目录聚合」——与账号完全无关，切多少次都一致。
+    // 旧版本没有 spaces 表，直接跳过。
+    let (spaces_neutralized, sessions_unbound) = if table_exists(&conn, "spaces")
+        && column_exists(&conn, "sessions", "space_id")
+    {
+        let now = now_ms();
+        let n = conn
+            .execute(
+                "UPDATE spaces SET deleted_at = ?1, updated_at = ?1 WHERE deleted_at < 0",
+                [now],
+            )
+            .unwrap_or(0);
+        let u = conn
+            .execute(
+                "UPDATE sessions SET space_id = NULL \
+                 WHERE space_id IS NOT NULL AND space_id <> ''",
+                [],
+            )
+            .unwrap_or(0);
+        (n as i64, u as i64)
+    } else {
+        (0, 0)
+    };
+
+    // 分组走「按目录聚合」后，显示名依赖本文件；新目录缺失会退化成完整路径。
+    // 放在归位之后执行：此时 space_id 已清空，cwd 集合不受影响。
+    let display_names = sync_workspace_display_names(&conn, db)
+        .unwrap_or_else(|e| json!({ "error": e }));
+
     let sql_claw = format!(
         "SELECT COUNT(*) FROM sessions WHERE deleted_at IS NULL AND user_id <> '' AND {SQL_IS_CLAW}"
     );
@@ -589,6 +739,9 @@ fn share_sessions_in(db: &Path) -> Result<Value, String> {
         "total": alive,
         "shared": shared as i64,
         "skippedClaw": skipped_claw,
+        "spacesNeutralized": spaces_neutralized,
+        "sessionsUnbound": sessions_unbound,
+        "displayNames": display_names,
     }))
 }
 

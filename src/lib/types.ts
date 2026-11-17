@@ -179,6 +179,12 @@ export interface SwitchResult {
     total: number;
     shared: number;
     skippedClaw: number;
+    /** 被软删的分组数（新版客户端的 spaces 表按账号隔离，共享会话时一并归一化） */
+    spacesNeutralized?: number;
+    /** 被解绑 space_id 的会话数（使其重新走「按工作目录聚合」） */
+    sessionsUnbound?: number;
+    /** 显示名映射的补齐结果：本次新增几条、合计几条 */
+    displayNames?: { added: number; total: number; error?: string };
     error?: string;
   };
   sessionCopy?: {

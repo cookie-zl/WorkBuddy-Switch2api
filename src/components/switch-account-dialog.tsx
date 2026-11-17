@@ -131,6 +131,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (typeof shared === "number" && shared > 0) {
         parts.push(`已把 ${shared} 个会话设为多账号共享`);
       }
+      // 新版客户端的「分组」按账号隔离，共享会话后必须一并归一化，
+      // 否则分组会变成 0 条的空壳、切号后甚至整体消失。幂等，只会在首次有值。
+      const spaces = res.sessionShare?.spacesNeutralized;
+      if (typeof spaces === "number" && spaces > 0) {
+        parts.push(`分组已回归按目录聚合（${spaces} 个）`);
+      }
       if (res.sessionCopy?.copied.length) {
         const copied = res.sessionCopy.copied;
         // 附属数据（工具输出目录、产物索引、任务、文件历史）会跟着会话一起搬，
